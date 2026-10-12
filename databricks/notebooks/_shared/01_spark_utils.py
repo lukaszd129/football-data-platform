@@ -5,7 +5,101 @@ from typing import Any, Mapping, Sequence
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
+from pyspark.sql.types import StructType
 
+
+# ---------------------------------------------------------------------------
+# Nested and optional column handling
+# ---------------------------------------------------------------------------
+
+def field_exists(
+    df: DataFrame,
+    column_path: str,
+) -> bool:
+    """
+    Check whether a top-level or nested field exists in a DataFrame.
+
+    Examples:
+        field_exists(df, "id")
+        field_exists(df, "team.name")
+        field_exists(df, "score.fullTime.home")
+
+    Returns False when any part of the path is missing
+    or an intermediate field is not a struct.
+    """
+
+    if not column_path:
+        raise ValueError("column_path cannot be empty.")
+
+    current_type = df.schema
+
+    for field_name in column_path.split("."):
+
+        if not isinstance(current_type, StructType):
+            return False
+
+        field = next(
+            (
+                field
+                for field in current_type.fields
+                if field.name == field_name
+            ),
+            None,
+        )
+
+        if field is None:
+            return False
+
+        current_type = field.dataType
+
+    return True
+
+
+def optional_col(
+    df: DataFrame,
+    column_path: str,
+    data_type: str = "string",
+) -> Column:
+    """
+    Return a Spark column cast to the requested type.
+
+    If the field does not exist, return a typed NULL.
+
+    Examples:
+        optional_col(df, "founded", "int")
+        optional_col(df, "area.id", "int")
+        optional_col(df, "lastUpdated", "timestamp")
+
+    Intended for optional source attributes only.
+    Required fields should be validated separately.
+    """
+
+    if field_exists(df, column_path):
+        return F.col(column_path).cast(data_type)
+
+    return F.lit(None).cast(data_type)
+
+
+def optional_string(
+    df: DataFrame,
+    column_path: str,
+) -> Column:
+    """
+    Return a cleaned string column.
+
+    Trims whitespace and converts empty strings to NULL.
+    Missing fields also return NULL.
+
+    Examples:
+        optional_string(df, "venue")
+        optional_string(df, "team.shortName")
+        optional_string(df, "area.name")
+    """
+
+    if field_exists(df, column_path):
+        return clean_string(column_path)
+
+    return F.lit(None).cast("string")
 
 # ---------------------------------------------------------------------------
 # Column validation
@@ -316,6 +410,501 @@ def validate_required_not_null(
         "row_count": row_count,
         **null_counts,
     }
+
+
+# ---------------------------------------------------------------------------
+# Entity resolution: canonical team identities
+# ---------------------------------------------------------------------------
+
+def load_team_mappings_by_id(
+    spark: SparkSession,
+    silver_schema: str,
+    source_system: str,
+) -> DataFrame:
+    """
+    Load validated mappings from source team IDs to canonical team keys.
+
+    Intended for providers that expose stable team IDs,
+    such as football-data.org.
+
+    Validates:
+      - reference tables exist
+      - source IDs and team keys are non-null
+      - source IDs are unique within the selected provider
+      - canonical keys are unique
+      - all mappings reference existing canonical teams
+
+    Returns:
+      source_team_id: string
+      team_key: long
+    """
+
+    if not silver_schema or not source_system:
+        raise ValueError(
+            "silver_schema and source_system cannot be empty."
+        )
+
+    mappings_table = f"{silver_schema}.team_mappings"
+    canonical_table = f"{silver_schema}.canonical_teams"
+
+    for table_name in [mappings_table, canonical_table]:
+        if not spark.catalog.tableExists(table_name):
+            raise ValueError(
+                f"Required reference table does not exist: {table_name}"
+            )
+
+    raw_mappings_df = spark.table(mappings_table)
+    raw_canonical_df = spark.table(canonical_table)
+
+    validate_columns_exist(
+        raw_mappings_df,
+        ["source_system", "source_team_id", "team_key"],
+    )
+    validate_columns_exist(
+        raw_canonical_df,
+        ["team_key"],
+    )
+
+    mappings_df = (
+        raw_mappings_df
+        .filter(F.col("source_system") == source_system)
+        .select(
+            F.trim(
+                F.col("source_team_id").cast("string")
+            ).alias("source_team_id"),
+            F.col("team_key").cast("long").alias("team_key"),
+        )
+    )
+
+    canonical_df = raw_canonical_df.select(
+        F.col("team_key").cast("long").alias("team_key")
+    )
+
+    # Required reference values
+    validate_required_not_null(
+        mappings_df,
+        ["source_team_id", "team_key"],
+        fail_on_null=True,
+    )
+
+    validate_required_not_null(
+        canonical_df,
+        ["team_key"],
+        fail_on_null=True,
+    )
+
+    if not mappings_df.limit(1).count():
+        raise ValueError(
+            f"No team mappings found for: {source_system}"
+        )
+
+    if mappings_df.filter(
+        F.col("source_team_id") == ""
+    ).limit(1).count():
+        raise ValueError(
+            "Empty source_team_id values found in team mappings."
+        )
+
+    # Source IDs must uniquely identify a canonical team.
+    source_duplicates = (
+        mappings_df
+        .groupBy("source_team_id")
+        .count()
+        .filter(F.col("count") > 1)
+        .limit(1)
+        .count()
+    )
+
+    if source_duplicates:
+        raise ValueError(
+            f"Duplicate team mappings for source: {source_system}"
+        )
+
+    # Canonical team keys must be unique.
+    canonical_duplicates = (
+        canonical_df
+        .groupBy("team_key")
+        .count()
+        .filter(F.col("count") > 1)
+        .limit(1)
+        .count()
+    )
+
+    if canonical_duplicates:
+        raise ValueError(
+            "Duplicate team_key values in canonical_teams."
+        )
+
+    # All mappings must reference existing canonical teams.
+    invalid_keys_df = (
+        mappings_df
+        .select("team_key")
+        .distinct()
+        .join(
+            canonical_df,
+            on="team_key",
+            how="left_anti",
+        )
+    )
+
+    if invalid_keys_df.limit(1).count():
+        raise ValueError(
+            "Team mappings reference nonexistent canonical teams."
+        )
+
+    print(
+        f"Validated team mappings for source: {source_system}"
+    )
+
+    return mappings_df
+
+
+def resolve_team_keys_by_id(
+    df: DataFrame,
+    mappings_df: DataFrame,
+    *,
+    source_id_column: str,
+    output_key_column: str,
+    fail_on_unmapped: bool = True,
+) -> DataFrame:
+    """
+    Resolve canonical team keys using source-specific team IDs.
+
+    Parameters
+    ----------
+    df:
+        Source DataFrame containing team IDs.
+
+    mappings_df:
+        Validated DataFrame returned by load_team_mappings_by_id().
+
+    source_id_column:
+        Name of the source team ID column, e.g. "home_team_id".
+
+    output_key_column:
+        Name of the resulting canonical key column,
+        e.g. "home_team_key".
+
+    fail_on_unmapped:
+        When True, fail if any source team cannot be resolved.
+
+    Returns
+    -------
+    DataFrame with an additional canonical team key column.
+
+    Original source ID and name columns are preserved.
+    """
+
+    validate_columns_exist(df, [source_id_column])
+    validate_columns_exist(
+        mappings_df,
+        ["source_team_id", "team_key"],
+    )
+
+    if output_key_column in df.columns:
+        raise ValueError(
+            f"Output column already exists: {output_key_column}"
+        )
+
+    # Use internal names to avoid collisions with source columns.
+    lookup_id = "__team_mapping_source_id"
+    lookup_key = "__team_mapping_canonical_key"
+
+    if any(
+        col in df.columns
+        for col in [lookup_id, lookup_key]
+    ):
+        raise ValueError(
+            "Source DataFrame contains reserved mapping columns."
+        )
+
+    lookup_df = (
+        mappings_df
+        .select(
+            F.col("source_team_id").alias(lookup_id),
+            F.col("team_key").alias(lookup_key),
+        )
+    )
+
+    # Detect ambiguous mappings before joining.
+    duplicate_ids = (
+        lookup_df
+        .groupBy(lookup_id)
+        .count()
+        .filter(F.col("count") > 1)
+        .limit(1)
+        .count()
+    )
+
+    if duplicate_ids:
+        raise ValueError(
+            "Mapping lookup contains duplicate source team IDs."
+        )
+
+    resolved_df = (
+        df
+        .join(
+            F.broadcast(lookup_df),
+            F.trim(
+                F.col(source_id_column).cast("string")
+            ) == F.col(lookup_id),
+            how="left",
+        )
+        .withColumn(
+            output_key_column,
+            F.col(lookup_key),
+        )
+        .drop(lookup_id, lookup_key)
+    )
+
+    # Do not silently publish unresolved team identities.
+    if fail_on_unmapped:
+        unmapped_df = (
+            resolved_df
+            .filter(F.col(output_key_column).isNull())
+            .select(source_id_column)
+            .distinct()
+        )
+
+        if unmapped_df.limit(1).count():
+            examples = [
+                row[source_id_column]
+                for row in unmapped_df.limit(20).collect()
+            ]
+
+            raise ValueError(
+                f"Unmapped teams for {source_id_column}. "
+                f"Example source IDs: {examples}"
+            )
+
+    return resolved_df
+
+
+# ---------------------------------------------------------------------------
+# Entity resolution: team names
+# ---------------------------------------------------------------------------
+
+def load_team_mappings_by_name(
+    spark: SparkSession,
+    silver_schema: str,
+    source_system: str,
+) -> DataFrame:
+    """
+    Load validated source-name-to-canonical-team mappings.
+
+    Intended for providers without stable team IDs in our datasets,
+    such as FBref and football-data.co.uk.
+
+    Matching uses exact source names after trimming whitespace.
+    """
+
+    if not silver_schema or not source_system:
+        raise ValueError(
+            "silver_schema and source_system cannot be empty."
+        )
+
+    mappings_table = f"{silver_schema}.team_mappings"
+    canonical_table = f"{silver_schema}.canonical_teams"
+
+    for table_name in [mappings_table, canonical_table]:
+        if not spark.catalog.tableExists(table_name):
+            raise ValueError(
+                f"Required reference table does not exist: {table_name}"
+            )
+
+    raw_mappings_df = spark.table(mappings_table)
+    raw_canonical_df = spark.table(canonical_table)
+
+    validate_columns_exist(
+        raw_mappings_df,
+        ["source_system", "source_team_name", "team_key"],
+    )
+    validate_columns_exist(
+        raw_canonical_df,
+        ["team_key"],
+    )
+
+    mappings_df = (
+        raw_mappings_df
+        .filter(F.col("source_system") == source_system)
+        .select(
+            F.trim(F.col("source_team_name"))
+            .alias("source_team_name"),
+            F.col("team_key").cast("long")
+            .alias("team_key"),
+        )
+    )
+
+    canonical_df = raw_canonical_df.select(
+        F.col("team_key").cast("long").alias("team_key")
+    )
+
+    # Required values must be present.
+    validate_required_not_null(
+        mappings_df,
+        ["source_team_name", "team_key"],
+        fail_on_null=True,
+    )
+
+    validate_required_not_null(
+        canonical_df,
+        ["team_key"],
+        fail_on_null=True,
+    )
+
+    if not mappings_df.limit(1).count():
+        raise ValueError(
+            f"No team mappings found for source: {source_system}"
+        )
+
+    if mappings_df.filter(
+        F.col("source_team_name") == ""
+    ).limit(1).count():
+        raise ValueError(
+            f"Empty source team names found for: {source_system}"
+        )
+
+    # Trimmed names must be unique within the provider.
+    duplicate_names = (
+        mappings_df
+        .groupBy("source_team_name")
+        .count()
+        .filter(F.col("count") > 1)
+        .limit(1)
+        .count()
+    )
+
+    if duplicate_names:
+        raise ValueError(
+            f"Duplicate source team names found for: {source_system}"
+        )
+
+    # Canonical keys must be unique.
+    duplicate_canonical_keys = (
+        canonical_df
+        .groupBy("team_key")
+        .count()
+        .filter(F.col("count") > 1)
+        .limit(1)
+        .count()
+    )
+
+    if duplicate_canonical_keys:
+        raise ValueError(
+            "Duplicate team_key values in canonical_teams."
+        )
+
+    # Every mapping must point to an existing canonical team.
+    invalid_keys = (
+        mappings_df
+        .select("team_key")
+        .distinct()
+        .join(canonical_df, on="team_key", how="left_anti")
+        .limit(1)
+        .count()
+    )
+
+    if invalid_keys:
+        raise ValueError(
+            "Team mappings reference nonexistent canonical teams."
+        )
+
+    print(
+        f"Validated name-based team mappings for: {source_system}"
+    )
+
+    return mappings_df
+
+
+def resolve_team_keys_by_name(
+    df: DataFrame,
+    mappings_df: DataFrame,
+    *,
+    source_name_column: str,
+    output_key_column: str,
+    fail_on_unmapped: bool = True,
+) -> DataFrame:
+    """
+    Resolve a source team name to a canonical team_key.
+
+    Preserves the original source name and all existing columns.
+
+    Raises ValueError on missing mappings by default.
+    """
+
+    validate_columns_exist(df, [source_name_column])
+    validate_columns_exist(
+        mappings_df,
+        ["source_team_name", "team_key"],
+    )
+
+    if output_key_column in df.columns:
+        raise ValueError(
+            f"Output column already exists: {output_key_column}"
+        )
+
+    lookup_name = "__team_mapping_source_name"
+    lookup_key = "__team_mapping_canonical_key"
+
+    if any(
+        col in df.columns
+        for col in [lookup_name, lookup_key]
+    ):
+        raise ValueError(
+            "Source DataFrame contains reserved mapping columns."
+        )
+
+    lookup_df = mappings_df.select(
+        F.col("source_team_name").alias(lookup_name),
+        F.col("team_key").alias(lookup_key),
+    )
+
+    # Protect against one-to-many joins.
+    duplicate_names = (
+        lookup_df
+        .groupBy(lookup_name)
+        .count()
+        .filter(F.col("count") > 1)
+        .limit(1)
+        .count()
+    )
+
+    if duplicate_names:
+        raise ValueError(
+            "Mapping lookup contains duplicate source team names."
+        )
+
+    resolved_df = (
+        df
+        .join(
+            F.broadcast(lookup_df),
+            F.trim(F.col(source_name_column)) == F.col(lookup_name),
+            how="left",
+        )
+        .withColumn(output_key_column, F.col(lookup_key))
+        .drop(lookup_name, lookup_key)
+    )
+
+    if fail_on_unmapped:
+        unmapped_df = (
+            resolved_df
+            .filter(F.col(output_key_column).isNull())
+            .select(source_name_column)
+            .distinct()
+        )
+
+        if unmapped_df.limit(1).count():
+            examples = [
+                row[source_name_column]
+                for row in unmapped_df.limit(20).collect()
+            ]
+
+            raise ValueError(
+                f"Unmapped teams for {source_name_column}. "
+                f"Example names: {examples}"
+            )
+
+    return resolved_df
 
 
 # ---------------------------------------------------------------------------
