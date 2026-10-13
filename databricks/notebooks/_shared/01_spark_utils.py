@@ -1023,3 +1023,142 @@ def map_values(
         mapped_value,
         F.lit(default_value),
     )
+
+
+# ---------------------------------------------------------------------------
+# Bronze source-file incremental loading
+# ---------------------------------------------------------------------------
+# Each source file is treated as a complete snapshot for one logical
+# Bronze slice (for example: league + season).
+#
+# An unchanged source hash is skipped.
+# A changed source replaces its slice atomically in Delta.
+#
+# Silver remains responsible for business transformations.
+# ---------------------------------------------------------------------------
+
+import hashlib
+from pathlib import Path
+
+
+def calculate_file_sha256(file_path: str) -> str:
+    """Calculate a reproducible hash of the raw source file."""
+
+    digest = hashlib.sha256()
+
+    with open(file_path, "rb") as file:
+        for chunk in iter(
+            lambda: file.read(1024 * 1024),
+            b"",
+        ):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+
+def bronze_file_needs_processing(
+    spark: SparkSession,
+    table_name: str,
+    replace_predicate: str,
+    source_hash: str,
+) -> bool:
+    """
+    Return True when a Bronze snapshot needs processing.
+
+    Handles:
+    - Bronze table does not exist
+    - Legacy table missing incremental metadata columns
+    - Existing slice contains no records
+    - Existing slice contains a different source hash
+    - Existing slice is unchanged
+    """
+
+    # First execution: target table doesn't exist.
+    if not spark.catalog.tableExists(table_name):
+        return True
+
+    existing_df = spark.table(table_name)
+
+    # Check that the columns used by the incremental-loading
+    # strategy exist before evaluating the replacement predicate.
+    #
+    # These metadata columns are introduced by the new Bronze
+    # implementation. Legacy tables may not contain them.
+    if (
+        "_raw_sha256" not in existing_df.columns
+        or (
+            "_season_id" in replace_predicate
+            and "_season_id" not in existing_df.columns
+        )
+    ):
+        return True
+
+    # Check whether this particular source snapshot
+    # has already been processed.
+    existing_df = existing_df.where(
+        F.expr(replace_predicate)
+    )
+
+    hashes = (
+        existing_df
+        .select("_raw_sha256")
+        .distinct()
+        .limit(2)
+        .collect()
+    )
+
+    return not (
+        len(hashes) == 1
+        and hashes[0]["_raw_sha256"] == source_hash
+    )
+
+
+
+def write_bronze_file_snapshot(
+    df: DataFrame,
+    table_name: str,
+    replace_predicate: str,
+    source_hash: str,
+) -> None:
+    """
+    Atomically load one complete source snapshot into Bronze.
+
+    Existing rows satisfying replace_predicate are replaced.
+    All other records are preserved.
+
+    The DataFrame must contain the columns referenced in
+    replace_predicate and must represent a complete source slice.
+    """
+
+    # Never replace existing Bronze records with an empty input.
+    if df.limit(1).count() == 0:
+        raise ValueError(
+            f"Refusing empty Bronze snapshot: {table_name}"
+        )
+
+    bronze_df = df.withColumn(
+        "_raw_sha256",
+        F.lit(source_hash),
+    )
+
+    if not df.sparkSession.catalog.tableExists(table_name):
+
+        (
+            bronze_df.write
+            .format("delta")
+            .mode("append")
+            .option("mergeSchema", "true")
+            .saveAsTable(table_name)
+        )
+
+    else:
+
+        (
+            bronze_df.write
+            .format("delta")
+            .mode("overwrite")
+            .option("replaceWhere", replace_predicate)
+            .option("mergeSchema", "true")
+            .saveAsTable(table_name)
+        )
